@@ -1,9 +1,9 @@
-from threading import Thread, Event
+from threading import Thread, Event, Timer
 from scapy.all import sendp
 from scapy.all import Packet, Ether, IP, ARP
 from async_sniff import sniff
 from cpu_metadata import CPUMetadata
-from pwospf_protocol import PWOSPF_HEADER, PWOSPF_HELLO, PWOSPF_LSU
+from pwospf_protocol import PWOSPF_HEADER, PWOSPF_HELLO, PWOSPF_LSU, PWOSPF_ADV
 import time
 
 import pdb
@@ -13,117 +13,67 @@ OSPF_LSU = 4
 ALLSPFRouters = "224.0.0.5"
 
 
-class PWOSPFSniff(Thread):
-    def __init__(self, sw, controller):
-        super(PWOSPFSniff, self).__init__()
-        self.sw = sw
-        self.iface = sw.intfs[1].name  # 0 is loopback
-        self.stop_event = Event()
-        self.controller = controller
-
-    def run(self):
-        if self.sw.name == "s2":
-            print("I'm s2: sniffing")
-
-        elif self.sw.name == "s3":
-            print("I'm s3: sniffing")
-
-        elif self.sw.name == "s1":
-            print("I'm s1: sniffing")
-
-        sniff(iface=self.iface, prn=self.handlePkt, stop_event=self.stop_event)
-
-    def handlePWOSPFHello(self, pkt):
-        if self.sw.name == "s2":
-            print("I'm s2: ")
-            print(pkt)
-            self.controller.updateRouting(pkt)
-        # elif self.sw.name == "s3":
-        #     print("I'm s3: ")
-        #     pkt.show2()
-        # elif self.sw.name == "s1":
-        #     print("I'm s1: ")
-        #     pkt.show2()
-
-        return
-
-    def handlePWOSPFLSU(self, pkt):
-        # self.addMacAddr(pkt[ARP].hwsrc, pkt[CPUMetadata].srcPort)
-        self.send(pkt)
-
-    def handlePkt(self, pkt):
-        if self.sw.name == "s2":
-            self.handlePWOSPFHello(pkt)
-
-        # assert (
-        #     CPUMetadata in pkt
-        # ), "Should only receive packets from switch with special header"
-
-        # if PWOSPF_HEADER in pkt:
-        #     # print(pkt[PWOSPF_HEADER].type)
-        #     if pkt[PWOSPF_HEADER].type == OSPF_HELLO:
-        #         print("PWOSPF_HELLO found")
-        #         self.handlePWOSPFHello(pkt)
-        #     elif pkt[PWOSPF_HEADER].type == OSPF_LSU:
-        #         print("PWOSPF_LSU found")
-        #         self.handlePWOSPFLSU(pkt)
-
-
 class PWOSPFController(Thread):
     def __init__(
-        self, sw, address, rid, area_id, network_mask, fr, network, start_wait=5
+        self,
+        sw,
+        controller_address,
+        rid,
+        area_id,
+        host_connected,
+        network_mask,
+        fr,
+        network,
+        hello_timer,
+        start_wait=5,
     ):
         super(PWOSPFController, self).__init__()
         self.sw = sw
-        self.address = address
+        self.controller_address = controller_address
         self.rid = rid
         self.area_id = area_id
         self.mask = network_mask
         self.start_wait = start_wait  # time to wait for the controller to be listenning
         self.iface = sw.intfs[1].name  # 0 is loopback
-        self.network = network
-        self.routingTable = {sw.name: []}
+        self.host_connected = host_connected
+        self.routingTable = {}
+        self.links = set()
+        self.nodes = set()
+        self.neighbours = set()
+        self.forwarding_ports = {}
         self.stop_event = Event()
         self.addForwardingRules(fr)
         self.initialise_routing_table()
-        self.computeDijkstra(network)
+        self.computeDijkstra()
         self.setupMulticast(10)
+        self.hello_timer = hello_timer
 
     def initialise_routing_table(self):
-        me = self.sw.name
+        me = self.controller_address
 
-        links = self.network.topo.links()
-        nodes = self.network.topo.nodes()
-        for node in nodes:
+        self.nodes.add(me)
+
+        for entry in self.host_connected:
+            self.links.add((me, entry[0]))
+            self.nodes.add(entry[0])
+            self.forwarding_ports[entry[0]] = entry[2]
+            self.neighbours.add(entry[0])
+
+        for node in self.nodes:
             self.routingTable[node] = {}
 
-        # for the future
-        # for node in nodes:
-        #     for node2 in nodes:
-        #         if node != node2:
-        #             self.routingTable[node][node2] = float("inf")
-        #         else:
-        #             self.routingTable[node][node] = 0
-
-        # for node in nodes:
-        #     if (me, node) in links or (node, me) in links:
-        #         self.routingTable[me][node] = 1
-
-        # complete topology from mininet
-        for node in nodes:
+        for node in self.nodes:
             self.routingTable[node][node] = 0
 
-        for link in links:
+        for link in self.links:
             self.routingTable[link[0]][link[1]] = 1
             self.routingTable[link[1]][link[0]] = 1
 
-        # print(self.routingTable)
-
-    def computeDijkstra(self, network):
+    def computeDijkstra(self):
 
         me = self.sw.name
-        links = self.network.topo.links()
-        nodes = self.network.topo.nodes()
+        links = self.links
+        nodes = self.nodes
         unvisited = set()
         dist = {}
         prev = {}
@@ -156,9 +106,6 @@ class PWOSPFController(Thread):
                         dist[node] = new_route
                         prev[node] = checking
 
-        # print(dist)
-        # print(prev)
-
     def setupMulticast(self, mgid):
         self.sw.insertTableEntry(
             table_name="MyIngress.ipv4_lpm",
@@ -177,23 +124,81 @@ class PWOSPFController(Thread):
                 action_params={"dstAddr": entry[1], "port": entry[2]},
             )
 
-    def createHelloPacket(self):
+    def sendHelloPacket(self):
         hello = (
             Ether(dst="ff:ff:ff:ff:ff:ff")
             / CPUMetadata(fromCPU=1)
-            / IP(src=self.address, dst=ALLSPFRouters)
+            / IP(src=self.controller_address, dst=ALLSPFRouters)
             / PWOSPF_HEADER(
                 type=1, packet_length=32, router_ID=self.rid, aread_ID=self.area_id
             )
             / PWOSPF_HELLO(network_mask=self.mask)
         )
 
-        return hello
+        self.send(hello)
 
-    def updateRouting(self, rt):
+    def sendLSUPackets(self):
         if self.sw.name == "s2":
-            print("I'm s2: ")
-            print("new routing", rt.show2())
+
+            for node in self.neighbours:
+                for route in self.routingTable[self.controller_address]:
+                    lsu = (
+                        Ether(dst="ff:ff:ff:ff:ff:ff")
+                        / CPUMetadata(fromCPU=1)
+                        / IP(src=self.controller_address, dst=node)
+                        / PWOSPF_HEADER(
+                            type=4,
+                            packet_length=32,
+                            router_ID=self.rid,
+                            aread_ID=self.area_id,
+                        )
+                        / PWOSPF_LSU()
+                        / PWOSPF_ADV(
+                            subnet=0x0A000005,  # should put the converted route here
+                            mask=0xFFFFFFFF,
+                            router_id=self.rid,
+                        )
+                    )
+                    self.send(lsu)
+
+    def sendRegularlyHello(self):
+        self.sendHelloPacket()
+        Timer(self.hello_timer, self.sendHelloPacket).start()
+
+    def updateRoutingTable(self, new_entry):
+        print("updating routing table with new entry: ", new_entry)
+        print(self.routingTable)
+        self.routingTable[self.controller_address][new_entry] = 1
+        self.routingTable[new_entry] = {}
+        self.routingTable[new_entry][self.controller_address] = 1
+        print(self.routingTable)
+        self.sendLSUPackets()
+
+    def handlePWOSPFHello(self, pkt):
+        source = str(pkt[IP].src)
+        self.nodes.add(source)
+        self.links.add((self.controller_address, source))
+        if source not in self.routingTable:
+            self.updateRoutingTable(source)
+            self.forwarding_ports[source] = pkt[CPUMetadata].srcPort
+            print(self.forwarding_ports)
+            self.computeDijkstra()
+            print("new entry, recomputing dijkstra:")
+            print(self.routingTable)
+
+    def handlePWOSPFLSU(self, pkt):
+        print("NEW LSU")
+        pkt.show2()
+
+    def handlePkt(self, pkt):
+        if PWOSPF_HEADER in pkt:
+            if pkt[PWOSPF_HEADER].type == OSPF_HELLO:
+                self.handlePWOSPFHello(pkt)
+            elif pkt[PWOSPF_HEADER].type == OSPF_LSU:
+                self.handlePWOSPFLSU(pkt)
+
+    def runSniff(self):
+        sniff(iface=self.iface, prn=self.handlePkt, stop_event=self.stop_event)
 
     def send(self, *args, **override_kwargs):
         pkt = args[0]
@@ -204,12 +209,17 @@ class PWOSPFController(Thread):
         sendp(*args, **kwargs)
 
     def run(self):
-        sniffer = PWOSPFSniff(self.sw, self)
-        sniffer.start()
-        while True:
-            hello = self.createHelloPacket()
-            self.send(hello)
-            time.sleep(15)
+        if self.sw.name == "s2":
+            print("I'm s2: sniffing")
+
+        elif self.sw.name == "s3":
+            print("I'm s3: sniffing")
+
+        elif self.sw.name == "s1":
+            print("I'm s1: sniffing")
+
+        Thread(target=self.runSniff).start()
+        Thread(target=self.sendRegularlyHello).start()
 
     def start(self, *args, **kwargs):
         super(PWOSPFController, self).start(*args, **kwargs)

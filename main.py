@@ -45,7 +45,7 @@ s1, s2, h1, h2, c1, c2, s3, c3, h3 = (
 #                       | 3                              | 3
 #                       |                                |
 #                       |                                |
-#         10.10.10.3    | 3                            3 |  10.10.10.4
+#         10.0.0.3      | 3                            3 |  10.0.0.4
 #                     * - *                            * - *
 #                     | h1|                            | h2|
 #                     * - *                            * - *
@@ -78,13 +78,19 @@ fr3 = [
 ]
 
 # Start the pwospf controller
-controller1 = PWOSPFController(s1, "10.0.0.1", 1, 1, 0xFFFFFF00, fr1, net)
+controller1 = PWOSPFController(
+    s1, "10.0.0.1", 1, 1, [("10.0.0.3", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr1, net, 60
+)
 controller1.start()
 
-controller2 = PWOSPFController(s2, "10.0.0.2", 2, 1, 0xFFFFFF00, fr2, net)
+controller2 = PWOSPFController(
+    s2, "10.0.0.2", 2, 1, [("10.0.0.4", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr2, net, 60
+)
 controller2.start()
 
-controller3 = PWOSPFController(s3, "10.0.0.5", 3, 1, 0xFFFFFF00, fr3, net)
+controller3 = PWOSPFController(
+    s3, "10.0.0.5", 3, 1, [("10.0.0.6", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr3, net, 60
+)
 controller3.start()
 
 # addForwardingRule(s1, 1, 1)
