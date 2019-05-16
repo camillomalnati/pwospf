@@ -188,6 +188,9 @@ class PWOSPFController(Thread):
 
     def handlePWOSPFLSU(self, pkt):
         print("NEW LSU")
+        # source = pkt[IP].src
+        # updated = pkt[PWOSPF_ADV].subnet
+        # self.routingTable[source][updated]
         pkt.show2()
 
     def handlePkt(self, pkt):
