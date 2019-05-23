@@ -36,6 +36,7 @@ class PWOSPFController(Thread):
         self.start_wait = start_wait  # time to wait for the controller to be listenning
         self.iface = sw.intfs[1].name  # 0 is loopback
         self.host_connected = host_connected
+        self.oldRoutingTable = {}
         self.routingTable = {}
         self.links = set()
         self.nodes = set()
@@ -68,6 +69,8 @@ class PWOSPFController(Thread):
         for link in self.links:
             self.routingTable[link[0]][link[1]] = 1
             self.routingTable[link[1]][link[0]] = 1
+
+        self.oldRoutingTable = self.routingTable
 
     def computeDijkstra(self):
 
@@ -134,38 +137,49 @@ class PWOSPFController(Thread):
             )
             / PWOSPF_HELLO(network_mask=self.mask)
         )
-
         self.send(hello)
 
-    def sendLSUPackets(self):
-        if self.sw.name == "s2":
+    def IP2Int(self, ip):
+        o = map(int, ip.split("."))
+        res = (16777216 * o[0]) + (65536 * o[1]) + (256 * o[2]) + o[3]
+        return res
 
-            for node in self.neighbours:
-                for route in self.routingTable[self.controller_address]:
-                    lsu = (
-                        Ether(dst="ff:ff:ff:ff:ff:ff")
-                        / CPUMetadata(fromCPU=1)
-                        / IP(src=self.controller_address, dst=node)
-                        / PWOSPF_HEADER(
-                            type=4,
-                            packet_length=32,
-                            router_ID=self.rid,
-                            aread_ID=self.area_id,
-                        )
-                        / PWOSPF_LSU()
-                        / PWOSPF_ADV(
-                            subnet=0x0A000005,  # should put the converted route here
-                            mask=0xFFFFFFFF,
-                            router_id=self.rid,
-                        )
+    def Int2IP(self, ipnum):
+        o1 = int(ipnum / 16777216) % 256
+        o2 = int(ipnum / 65536) % 256
+        o3 = int(ipnum / 256) % 256
+        o4 = int(ipnum) % 256
+        return "%(o1)s.%(o2)s.%(o3)s.%(o4)s" % locals()
+
+    def sendLSUPackets(self):
+        for node in self.neighbours:
+            for route in self.routingTable[self.controller_address]:
+                subnet = self.IP2Int(route)
+                lsu = (
+                    Ether(dst="ff:ff:ff:ff:ff:ff")
+                    / CPUMetadata(fromCPU=1)
+                    / IP(src=self.controller_address, dst=node)
+                    / PWOSPF_HEADER(
+                        type=4,
+                        packet_length=32,
+                        router_ID=self.rid,
+                        aread_ID=self.area_id,
                     )
-                    self.send(lsu)
+                    / PWOSPF_LSU()
+                    / PWOSPF_ADV(
+                        subnet=subnet,  # should put the converted route here
+                        mask=0xFFFFFFFF,
+                        router_id=0,
+                    )
+                )
+                self.send(lsu)
 
     def sendRegularlyHello(self):
         self.sendHelloPacket()
         Timer(self.hello_timer, self.sendHelloPacket).start()
 
     def updateRoutingTable(self, new_entry):
+        self.oldRoutingTable = self.routingTable
         print("updating routing table with new entry: ", new_entry)
         print(self.routingTable)
         self.routingTable[self.controller_address][new_entry] = 1
@@ -178,20 +192,33 @@ class PWOSPFController(Thread):
         source = str(pkt[IP].src)
         self.nodes.add(source)
         self.links.add((self.controller_address, source))
+
         if source not in self.routingTable:
             self.updateRoutingTable(source)
             self.forwarding_ports[source] = pkt[CPUMetadata].srcPort
             print(self.forwarding_ports)
             self.computeDijkstra()
+            self.checkForLSU()
             print("new entry, recomputing dijkstra:")
             print(self.routingTable)
 
+    def checkForLSU(self):
+        self.computeDijkstra()
+        if (
+            self.routingTable[self.controller_address]
+            != self.oldRoutingTable[self.controller_address]
+        ):
+            self.sendLSUPackets()
+            print(self.routingTable)
+
     def handlePWOSPFLSU(self, pkt):
-        print("NEW LSU")
-        # source = pkt[IP].src
-        # updated = pkt[PWOSPF_ADV].subnet
-        # self.routingTable[source][updated]
-        pkt.show2()
+        # add new link
+        source = pkt[IP].src
+        updated = self.Int2IP(pkt[PWOSPF_ADV].subnet)
+        self.nodes.add(updated)  # need to be checked maybe
+        self.links.add((source, updated))
+        self.routingTable[source][updated] = 1
+        self.checkForLSU()
 
     def handlePkt(self, pkt):
         if PWOSPF_HEADER in pkt:
@@ -223,6 +250,7 @@ class PWOSPFController(Thread):
 
         Thread(target=self.runSniff).start()
         Thread(target=self.sendRegularlyHello).start()
+        Timer(30, self.sendLSUPackets).start()
 
     def start(self, *args, **kwargs):
         super(PWOSPFController, self).start(*args, **kwargs)
