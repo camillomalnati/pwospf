@@ -36,7 +36,7 @@ class PWOSPFController(Thread):
         self.start_wait = start_wait  # time to wait for the controller to be listenning
         self.iface = sw.intfs[1].name  # 0 is loopback
         self.host_connected = host_connected
-        self.oldRoutingTable = {}
+        # self.oldRoutingTable = {}
         self.routingTable = {}
         self.links = set()
         self.nodes = set()
@@ -54,29 +54,33 @@ class PWOSPFController(Thread):
 
         self.nodes.add(me)
 
+        self.forwarding_ports[me] = 1  # cpu port
+
         for entry in self.host_connected:
             self.links.add((me, entry[0]))
             self.nodes.add(entry[0])
             self.forwarding_ports[entry[0]] = entry[2]
             self.neighbours.add(entry[0])
+            self.routingTable[entry[0]] = entry[2]
 
-        for node in self.nodes:
-            self.routingTable[node] = {}
+        # for node in self.nodes:
+        #     self.routingTable[node] = {}
 
-        for node in self.nodes:
-            self.routingTable[node][node] = 0
+        # for node in self.nodes:
+        #     self.routingTable[node][node] = 0
 
-        for link in self.links:
-            self.routingTable[link[0]][link[1]] = 1
-            self.routingTable[link[1]][link[0]] = 1
+        # for link in self.links:
+        #     self.routingTable[link[0]][link[1]] = 1
+        #     self.routingTable[link[1]][link[0]] = 1
 
-        self.oldRoutingTable = self.routingTable
+        # self.oldRoutingTable = self.routingTable
 
     def computeDijkstra(self):
 
-        me = self.sw.name
+        me = self.controller_address
         links = self.links
         nodes = self.nodes
+        neighbours = self.neighbours
         unvisited = set()
         dist = {}
         prev = {}
@@ -91,6 +95,7 @@ class PWOSPFController(Thread):
                 prev[node] = None
 
         dist[me] = 0
+        unvisited.remove(me)
 
         while len(unvisited) > 0:
             mininum = float("inf")
@@ -101,13 +106,33 @@ class PWOSPFController(Thread):
                     mininum = dist[node]
 
             unvisited.remove(checking)
-            for node, distance in self.routingTable[checking].items():
-                if node in unvisited:
-                    new_route = dist[checking] + distance
-                    if new_route < dist[node]:
-                        # print("new best route:", node, new_route, dist[node])
-                        dist[node] = new_route
-                        prev[node] = checking
+
+            neighbours_of_unvisited = set()
+            for link in links:
+                if checking in link:
+                    if link[0] == checking:
+                        neighbours_of_unvisited.add(link[1])
+                    else:
+                        neighbours_of_unvisited.add(link[0])
+
+            if me in neighbours_of_unvisited:
+                neighbours_of_unvisited.remove(me)
+
+            for node in neighbours_of_unvisited:
+                if dist[node] + dist[checking] < dist[checking]:
+                    dist[checking] = dist[node] + dist[checking]
+                    prev[checking] = node
+
+        for key, value in prev.items():
+            if key != me and value != None:
+                if self.sw.name == "s2":
+                    print(
+                        "++++++++", self.routingTable, self.forwarding_ports, key, value
+                    )
+                if key in self.forwarding_ports:
+                    self.routingTable[key] = self.forwarding_ports[key]
+                else:
+                    self.routingTable[key] = self.forwarding_ports[value]
 
     def setupMulticast(self, mgid):
         self.sw.insertTableEntry(
@@ -152,75 +177,86 @@ class PWOSPFController(Thread):
         return "%(o1)s.%(o2)s.%(o3)s.%(o4)s" % locals()
 
     def sendLSUPackets(self):
+        if self.sw.name == "s2":
+            print("new routing")
         for node in self.neighbours:
-            for route in self.routingTable[self.controller_address]:
-                subnet = self.IP2Int(route)
-                lsu = (
-                    Ether(dst="ff:ff:ff:ff:ff:ff")
-                    / CPUMetadata(fromCPU=1)
-                    / IP(src=self.controller_address, dst=node)
-                    / PWOSPF_HEADER(
-                        type=4,
-                        packet_length=32,
-                        router_ID=self.rid,
-                        aread_ID=self.area_id,
+            for node1 in self.neighbours:
+                if node != node1:
+                    subnet = self.IP2Int(node1)
+                    lsu = (
+                        Ether(dst="ff:ff:ff:ff:ff:ff")
+                        / CPUMetadata(fromCPU=1)
+                        / IP(src=self.controller_address, dst=node)
+                        / PWOSPF_HEADER(
+                            type=4,
+                            packet_length=32,
+                            router_ID=self.rid,
+                            aread_ID=self.area_id,
+                        )
+                        / PWOSPF_LSU()
+                        / PWOSPF_ADV(
+                            subnet=subnet,  # should put the converted route here
+                            mask=0xFFFFFFFF,
+                            router_id=0,
+                        )
                     )
-                    / PWOSPF_LSU()
-                    / PWOSPF_ADV(
-                        subnet=subnet,  # should put the converted route here
-                        mask=0xFFFFFFFF,
-                        router_id=0,
-                    )
-                )
-                self.send(lsu)
+                    self.send(lsu)
 
     def sendRegularlyHello(self):
         self.sendHelloPacket()
         Timer(self.hello_timer, self.sendHelloPacket).start()
 
-    def updateRoutingTable(self, new_entry):
-        self.oldRoutingTable = self.routingTable
-        print("updating routing table with new entry: ", new_entry)
-        print(self.routingTable)
-        self.routingTable[self.controller_address][new_entry] = 1
-        self.routingTable[new_entry] = {}
-        self.routingTable[new_entry][self.controller_address] = 1
-        print(self.routingTable)
-        self.sendLSUPackets()
-
     def handlePWOSPFHello(self, pkt):
         source = str(pkt[IP].src)
         self.nodes.add(source)
-        self.links.add((self.controller_address, source))
+        self.neighbours.add(source)
+        if self.sw.name == "s2":
+            print("I'm s2: new hello from", source)
+            print(self.links)
+            print(self.nodes)
 
-        if source not in self.routingTable:
-            self.updateRoutingTable(source)
+        if not (
+            (self.controller_address, source) in self.links
+            or (source, self.controller_address) in self.links
+        ):
+            self.links.add((self.controller_address, source))
+            # if self.sw.name == "s2":
+            #     print("added: ", (self.controller_address, source))
+            #     print("new nodes are:", (self.nodes))
+
+        if source not in self.forwarding_ports:
             self.forwarding_ports[source] = pkt[CPUMetadata].srcPort
-            print(self.forwarding_ports)
-            self.computeDijkstra()
-            self.checkForLSU()
-            print("new entry, recomputing dijkstra:")
-            print(self.routingTable)
+
+            #     self.computeDijkstra()
+            if self.sw.name == "s2":
+                self.checkForLSU()
 
     def checkForLSU(self):
+        if self.sw.name == "s2":
+            print("before", self.routingTable)
+        old_rt = self.routingTable.copy()
         self.computeDijkstra()
-        if (
-            self.routingTable[self.controller_address]
-            != self.oldRoutingTable[self.controller_address]
-        ):
+        if self.sw.name == "s2":
+            print("after", self.routingTable)
+            print("oldafter", old_rt)
+        if old_rt != self.routingTable:
             self.sendLSUPackets()
-            print(self.routingTable)
 
     def handlePWOSPFLSU(self, pkt):
-        # add new link
+        me = self.controller_address
         source = pkt[IP].src
         updated = self.Int2IP(pkt[PWOSPF_ADV].subnet)
+        self.nodes.add(source)
         self.nodes.add(updated)  # need to be checked maybe
-        self.links.add((source, updated))
-        self.routingTable[source][updated] = 1
+
+        if not ((source, updated) in self.links or (source, updated) in self.links):
+            self.links.add((source, updated))
+
         self.checkForLSU()
 
     def handlePkt(self, pkt):
+        if pkt[IP].src == self.controller_address:
+            return
         if PWOSPF_HEADER in pkt:
             if pkt[PWOSPF_HEADER].type == OSPF_HELLO:
                 self.handlePWOSPFHello(pkt)
@@ -250,7 +286,7 @@ class PWOSPFController(Thread):
 
         Thread(target=self.runSniff).start()
         Thread(target=self.sendRegularlyHello).start()
-        Timer(30, self.sendLSUPackets).start()
+        # Timer(30, self.sendLSUPackets).start()
 
     def start(self, *args, **kwargs):
         super(PWOSPFController, self).start(*args, **kwargs)
