@@ -79,17 +79,17 @@ fr3 = [
 
 # Start the pwospf controller
 controller1 = PWOSPFController(
-    s1, "10.0.0.1", 1, 1, [("10.0.0.3", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr1, net, 60
+    s1, "10.0.0.1", 1, 1, [("10.0.0.3", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr1, net, 15
 )
 controller1.start()
 
 controller2 = PWOSPFController(
-    s2, "10.0.0.2", 2, 1, [("10.0.0.4", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr2, net, 60
+    s2, "10.0.0.2", 2, 1, [("10.0.0.4", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr2, net, 15
 )
 controller2.start()
 
 controller3 = PWOSPFController(
-    s3, "10.0.0.5", 3, 1, [("10.0.0.6", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr3, net, 60
+    s3, "10.0.0.5", 3, 1, [("10.0.0.6", 0xFFFFFFFF, 3)], 0xFFFFFF00, fr3, net, 15
 )
 controller3.start()
 

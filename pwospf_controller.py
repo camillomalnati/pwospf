@@ -43,9 +43,8 @@ class PWOSPFController(Thread):
         self.neighbours = set()
         self.forwarding_ports = {}
         self.stop_event = Event()
-        self.addForwardingRules(fr)
+        # self.addForwardingRules(fr)
         self.initialise_routing_table()
-        self.computeDijkstra()
         self.setupMulticast(10)
         self.hello_timer = hello_timer
 
@@ -63,17 +62,12 @@ class PWOSPFController(Thread):
             self.neighbours.add(entry[0])
             self.routingTable[entry[0]] = entry[2]
 
-        # for node in self.nodes:
-        #     self.routingTable[node] = {}
+        self.computeDijkstra()
+        self.update_routing_table()
 
-        # for node in self.nodes:
-        #     self.routingTable[node][node] = 0
-
-        # for link in self.links:
-        #     self.routingTable[link[0]][link[1]] = 1
-        #     self.routingTable[link[1]][link[0]] = 1
-
-        # self.oldRoutingTable = self.routingTable
+    def update_routing_table(self):
+        for ip, port in self.routingTable.items():
+            self.addForwardingRule(ip, 0xFFFFFFFF, port)
 
     def computeDijkstra(self):
 
@@ -119,16 +113,15 @@ class PWOSPFController(Thread):
                 neighbours_of_unvisited.remove(me)
 
             for node in neighbours_of_unvisited:
-                if dist[node] + dist[checking] < dist[checking]:
+                if dist[node] + 1 < dist[checking]:
                     dist[checking] = dist[node] + dist[checking]
                     prev[checking] = node
 
+        # print("=======================", self.sw.name, "=====================")
+        # print(prev)
+
         for key, value in prev.items():
             if key != me and value != None:
-                if self.sw.name == "s2":
-                    print(
-                        "++++++++", self.routingTable, self.forwarding_ports, key, value
-                    )
                 if key in self.forwarding_ports:
                     self.routingTable[key] = self.forwarding_ports[key]
                 else:
@@ -143,14 +136,13 @@ class PWOSPFController(Thread):
         )
         self.sw.addMulticastGroup(mgid=mgid, ports=range(2, 6))  # we need to fix this
 
-    def addForwardingRules(self, fr):
-        for entry in fr:
-            self.sw.insertTableEntry(
-                table_name="MyIngress.ipv4_lpm",
-                match_fields={"hdr.ipv4.dstAddr": entry[0]},
-                action_name="MyIngress.ipv4_forward",
-                action_params={"dstAddr": entry[1], "port": entry[2]},
-            )
+    def addForwardingRule(self, ipv4, mac, port):
+        self.sw.insertTableEntry(
+            table_name="MyIngress.ipv4_lpm",
+            match_fields={"hdr.ipv4.dstAddr": [ipv4, 32]},
+            action_name="MyIngress.ipv4_forward",
+            action_params={"dstAddr": mac, "port": port},
+        )
 
     def sendHelloPacket(self):
         hello = (
@@ -177,10 +169,9 @@ class PWOSPFController(Thread):
         return "%(o1)s.%(o2)s.%(o3)s.%(o4)s" % locals()
 
     def sendLSUPackets(self):
-        if self.sw.name == "s2":
-            print("new routing")
         for node in self.neighbours:
             for node1 in self.neighbours:
+                print(self.sw.name, "LSU SENT to", node, "subnet", node1)
                 if node != node1:
                     subnet = self.IP2Int(node1)
                     lsu = (
@@ -210,36 +201,26 @@ class PWOSPFController(Thread):
         source = str(pkt[IP].src)
         self.nodes.add(source)
         self.neighbours.add(source)
-        if self.sw.name == "s2":
-            print("I'm s2: new hello from", source)
-            print(self.links)
-            print(self.nodes)
 
         if not (
             (self.controller_address, source) in self.links
             or (source, self.controller_address) in self.links
         ):
             self.links.add((self.controller_address, source))
-            # if self.sw.name == "s2":
-            #     print("added: ", (self.controller_address, source))
-            #     print("new nodes are:", (self.nodes))
 
         if source not in self.forwarding_ports:
             self.forwarding_ports[source] = pkt[CPUMetadata].srcPort
 
-            #     self.computeDijkstra()
-            if self.sw.name == "s2":
-                self.checkForLSU()
+        self.checkForLSU()
+
+        print(self.sw.name, "++++++HELLO")
+        print("rt: ", self.routingTable, "fp: ", self.forwarding_ports)
 
     def checkForLSU(self):
-        if self.sw.name == "s2":
-            print("before", self.routingTable)
         old_rt = self.routingTable.copy()
         self.computeDijkstra()
-        if self.sw.name == "s2":
-            print("after", self.routingTable)
-            print("oldafter", old_rt)
         if old_rt != self.routingTable:
+            self.update_routing_table()
             self.sendLSUPackets()
 
     def handlePWOSPFLSU(self, pkt):
@@ -249,10 +230,19 @@ class PWOSPFController(Thread):
         self.nodes.add(source)
         self.nodes.add(updated)  # need to be checked maybe
 
+        print("I'm " + self.sw.name + ": new LSU from", source)
+        if source not in self.forwarding_ports:
+            return
+
         if not ((source, updated) in self.links or (source, updated) in self.links):
             self.links.add((source, updated))
+            print("forwarding ports", self.forwarding_ports)
+            self.forwarding_ports[updated] = self.forwarding_ports[source]
 
         self.checkForLSU()
+
+        print(self.sw.name, "++++++LSU")
+        print("rt: ", self.routingTable, "fp: ", self.forwarding_ports)
 
     def handlePkt(self, pkt):
         if pkt[IP].src == self.controller_address:
@@ -286,7 +276,7 @@ class PWOSPFController(Thread):
 
         Thread(target=self.runSniff).start()
         Thread(target=self.sendRegularlyHello).start()
-        # Timer(30, self.sendLSUPackets).start()
+        Timer(30, self.sendLSUPackets).start()
 
     def start(self, *args, **kwargs):
         super(PWOSPFController, self).start(*args, **kwargs)
